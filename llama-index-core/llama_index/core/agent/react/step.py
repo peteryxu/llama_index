@@ -3,7 +3,6 @@
 import asyncio
 import uuid
 from functools import partial
-from itertools import chain
 from threading import Thread
 from typing import (
     Any,
@@ -54,7 +53,7 @@ from llama_index.core.prompts.mixin import PromptDictType
 from llama_index.core.settings import Settings
 from llama_index.core.tools import BaseTool, ToolOutput, adapt_to_async_tool
 from llama_index.core.tools.types import AsyncBaseTool
-from llama_index.core.utils import print_text, unit_generator
+from llama_index.core.utils import print_text
 
 
 def add_user_step_to_reasoning(
@@ -260,6 +259,8 @@ class ReActAgentWorker(BaseAgentWorker):
         tools_dict: Dict[str, AsyncBaseTool] = {
             tool.metadata.get_name(): tool for tool in tools
         }
+        tool = None
+
         try:
             _, current_reasoning, is_done = self._extract_reasoning_step(
                 output, is_streaming
@@ -290,6 +291,7 @@ class ReActAgentWorker(BaseAgentWorker):
                             tool_name=tool.metadata.name,
                             raw_input={"kwargs": reasoning_step.action_input},
                             raw_output=e,
+                            is_error=True,
                         )
                     event.on_end(
                         payload={EventPayload.FUNCTION_OUTPUT: str(tool_output)}
@@ -299,11 +301,19 @@ class ReActAgentWorker(BaseAgentWorker):
 
         task.extra_state["sources"].append(tool_output)
 
-        observation_step = ObservationReasoningStep(observation=str(tool_output))
+        observation_step = ObservationReasoningStep(
+            observation=str(tool_output),
+            return_direct=tool.metadata.return_direct and not tool_output.is_error
+            if tool
+            else False,
+        )
         current_reasoning.append(observation_step)
         if self._verbose:
             print_text(f"{observation_step.get_content()}\n", color="blue")
-        return current_reasoning, False
+        return (
+            current_reasoning,
+            tool.metadata.return_direct and not tool_output.is_error if tool else False,
+        )
 
     async def _aprocess_actions(
         self,
@@ -313,6 +323,8 @@ class ReActAgentWorker(BaseAgentWorker):
         is_streaming: bool = False,
     ) -> Tuple[List[BaseReasoningStep], bool]:
         tools_dict = {tool.metadata.name: tool for tool in tools}
+        tool = None
+
         try:
             _, current_reasoning, is_done = self._extract_reasoning_step(
                 output, is_streaming
@@ -343,6 +355,7 @@ class ReActAgentWorker(BaseAgentWorker):
                             tool_name=tool.metadata.name,
                             raw_input={"kwargs": reasoning_step.action_input},
                             raw_output=e,
+                            is_error=True,
                         )
                     event.on_end(
                         payload={EventPayload.FUNCTION_OUTPUT: str(tool_output)}
@@ -352,11 +365,19 @@ class ReActAgentWorker(BaseAgentWorker):
 
         task.extra_state["sources"].append(tool_output)
 
-        observation_step = ObservationReasoningStep(observation=str(tool_output))
+        observation_step = ObservationReasoningStep(
+            observation=str(tool_output),
+            return_direct=tool.metadata.return_direct and not tool_output.is_error
+            if tool
+            else False,
+        )
         current_reasoning.append(observation_step)
         if self._verbose:
             print_text(f"{observation_step.get_content()}\n", color="blue")
-        return current_reasoning, False
+        return (
+            current_reasoning,
+            tool.metadata.return_direct and not tool_output.is_error if tool else False,
+        )
 
     def _handle_nonexistent_tool_name(self, reasoning_step):
         # We still emit a `tool_output` object to the task, so that the LLM can know
@@ -374,6 +395,7 @@ class ReActAgentWorker(BaseAgentWorker):
                 tool_name=reasoning_step.action,
                 raw_input={"kwargs": reasoning_step.action_input},
                 raw_output=content,
+                is_error=True,
             )
             event.on_end(payload={EventPayload.FUNCTION_OUTPUT: str(tool_output)})
         return tool_output
@@ -392,6 +414,11 @@ class ReActAgentWorker(BaseAgentWorker):
         if isinstance(current_reasoning[-1], ResponseReasoningStep):
             response_step = cast(ResponseReasoningStep, current_reasoning[-1])
             response_str = response_step.response
+        elif (
+            isinstance(current_reasoning[-1], ObservationReasoningStep)
+            and current_reasoning[-1].return_direct
+        ):
+            response_str = current_reasoning[-1].observation
         else:
             response_str = current_reasoning[-1].get_content()
 
@@ -455,17 +482,12 @@ class ReActAgentWorker(BaseAgentWorker):
         Return:
             Generator[ChatResponse, None, None]: the updated chat_stream
         """
-        updated_stream = chain.from_iterable(  # need to add back partial response chunk
-            [
-                unit_generator(chunk),
-                chat_stream,
-            ]
-        )
-        # use cast to avoid mypy issue with chain and Generator
-        updated_stream_c: Generator[ChatResponse, None, None] = cast(
-            Generator[ChatResponse, None, None], updated_stream
-        )
-        return updated_stream_c
+
+        def gen() -> Generator[ChatResponse, None, None]:
+            yield chunk
+            yield from chat_stream
+
+        return gen()
 
     async def _async_add_back_chunk_to_stream(
         self, chunk: ChatResponse, chat_stream: AsyncGenerator[ChatResponse, None]
@@ -501,7 +523,6 @@ class ReActAgentWorker(BaseAgentWorker):
             )
         # TODO: see if we want to do step-based inputs
         tools = self.get_tools(task.input)
-
         input_chat = self._react_chat_formatter.format(
             tools,
             chat_history=task.memory.get() + task.extra_state["new_memory"].get_all(),
@@ -600,7 +621,7 @@ class ReActAgentWorker(BaseAgentWorker):
 
         if not is_done:
             # given react prompt outputs, call tools or return response
-            reasoning_steps, _ = self._process_actions(
+            reasoning_steps, is_done = self._process_actions(
                 task, tools=tools, output=full_response, is_streaming=True
             )
             task.extra_state["current_reasoning"].extend(reasoning_steps)
@@ -608,6 +629,13 @@ class ReActAgentWorker(BaseAgentWorker):
             agent_response: AGENT_CHAT_RESPONSE_TYPE = self._get_response(
                 task.extra_state["current_reasoning"], task.extra_state["sources"]
             )
+            if is_done:
+                agent_response.is_dummy_stream = True
+                task.extra_state["new_memory"].put(
+                    ChatMessage(
+                        content=agent_response.response, role=MessageRole.ASSISTANT
+                    )
+                )
         else:
             # Get the response in a separate thread so we can yield the response
             response_stream = self._add_back_chunk_to_stream(
@@ -664,7 +692,7 @@ class ReActAgentWorker(BaseAgentWorker):
 
         if not is_done:
             # given react prompt outputs, call tools or return response
-            reasoning_steps, _ = self._process_actions(
+            reasoning_steps, is_done = await self._aprocess_actions(
                 task, tools=tools, output=full_response, is_streaming=True
             )
             task.extra_state["current_reasoning"].extend(reasoning_steps)
@@ -672,6 +700,14 @@ class ReActAgentWorker(BaseAgentWorker):
             agent_response: AGENT_CHAT_RESPONSE_TYPE = self._get_response(
                 task.extra_state["current_reasoning"], task.extra_state["sources"]
             )
+
+            if is_done:
+                agent_response.is_dummy_stream = True
+                task.extra_state["new_memory"].put(
+                    ChatMessage(
+                        content=agent_response.response, role=MessageRole.ASSISTANT
+                    )
+                )
         else:
             # Get the response in a separate thread so we can yield the response
             response_stream = self._async_add_back_chunk_to_stream(
@@ -692,7 +728,7 @@ class ReActAgentWorker(BaseAgentWorker):
             # wait until response writing is done
             agent_response._ensure_async_setup()
 
-            await agent_response._is_function_false_event.wait()
+            await agent_response.is_function_false_event.wait()
 
         return self._get_task_step_response(agent_response, step, is_done)
 
